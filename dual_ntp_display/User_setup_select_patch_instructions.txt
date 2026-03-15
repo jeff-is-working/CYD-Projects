@@ -1,0 +1,35 @@
+// =========================================================================
+// HOW TO PATCH User_setup_select.h for the CYD
+//
+// File location (typical Mac Arduino install):
+//   ~/Documents/Arduino/libraries/TFT_eSPI/User_setup_select.h
+//
+// STEPS:
+//   1. Open User_setup_select.h in a text editor
+//   2. Find the currently active (uncommented) setup line - it usually
+//      looks like:  #include <User_Setups/Setup1_ILI9341.h>
+//   3. Comment it out by adding // at the start of that line
+//   4. Add the CYD line below it (already uncommented):
+//        #include <User_Setups/ESP32_Cheap_Yellow_Display.h>
+//   5. Make sure NO other #include lines in the file are uncommented.
+//      Only ONE setup can be active at a time.
+//   6. Save the file.
+//
+// =========================================================================
+
+// What the relevant section should look like after your edit:
+// (the exact line numbers will differ in your file, this shows the pattern)
+
+// ... other setups above, all commented out ...
+
+// #include <User_Setups/Setup1_ILI9341.h>     // <-- was active, now commented out
+   #include <User_Setups/ESP32_Cheap_Yellow_Display.h>  // CYD Elegoo 2.8" ESP32
+
+// ... other setups below, all commented out ...
+
+// =========================================================================
+// VERIFICATION
+// After making this change, open Arduino IDE and try:
+//   File > Examples > TFT_eSPI > 160x128 > TFT_graphicstest
+// If the display shows the graphics test, your setup is correct.
+// =========================================================================
