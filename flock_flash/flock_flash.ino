@@ -57,7 +57,7 @@
 #define RSSI_FAR      -85
 
 // ---- Device tracking ----
-#define MAX_DEVICES   200
+#define MAX_DEVICES   100           // surveillance-only entries
 
 struct DetectedDevice {
   char mac[18];
@@ -70,6 +70,64 @@ struct DetectedDevice {
   uint32_t lastSeen;
 };
 
+// ---- MAC hash set for dedup of ALL seen MACs ----
+// Open-addressing table with 16-bit fingerprints.  2048 slots = 4 KB RAM.
+#define MAC_HASH_SIZE  2048
+static uint16_t macHashTable[MAC_HASH_SIZE];   // 0 = empty
+static uint32_t totalMacsSeen = 0;
+
+// FNV-1a over the 17-char MAC string → 32 bits
+static uint32_t fnv1a_mac(const char* mac) {
+  uint32_t h = 2166136261u;
+  for (int i = 0; i < 17 && mac[i]; i++) {
+    uint8_t c = mac[i];
+    if (c >= 'a' && c <= 'z') c -= 32;   // case-insensitive
+    h ^= c;
+    h *= 16777619u;
+  }
+  return h;
+}
+
+// 16-bit fingerprint (never 0 — 0 means empty slot)
+static uint16_t macFingerprint(uint32_t h) {
+  uint16_t fp = (uint16_t)(h >> 16) ^ (uint16_t)h;
+  return fp ? fp : 1;
+}
+
+// Returns true if the MAC was NOT previously in the set (i.e. it is new).
+static bool macHashInsert(const char* mac) {
+  uint32_t h  = fnv1a_mac(mac);
+  uint16_t fp = macFingerprint(h);
+  uint16_t idx = h & (MAC_HASH_SIZE - 1);
+
+  for (uint16_t i = 0; i < MAC_HASH_SIZE; i++) {
+    uint16_t slot = (idx + i) & (MAC_HASH_SIZE - 1);
+    if (macHashTable[slot] == 0) {
+      macHashTable[slot] = fp;
+      totalMacsSeen++;
+      return true;   // new
+    }
+    if (macHashTable[slot] == fp) {
+      return false;  // already seen (with high probability)
+    }
+  }
+  return false;  // table full — treat as duplicate
+}
+
+// Check whether a MAC is already in the hash set (without inserting).
+static bool macHashContains(const char* mac) {
+  uint32_t h  = fnv1a_mac(mac);
+  uint16_t fp = macFingerprint(h);
+  uint16_t idx = h & (MAC_HASH_SIZE - 1);
+
+  for (uint16_t i = 0; i < MAC_HASH_SIZE; i++) {
+    uint16_t slot = (idx + i) & (MAC_HASH_SIZE - 1);
+    if (macHashTable[slot] == 0) return false;
+    if (macHashTable[slot] == fp) return true;
+  }
+  return false;
+}
+
 // (no BLE queue needed — using post-scan iteration instead of callbacks)
 
 // ============ GLOBALS ============
@@ -77,7 +135,7 @@ TFT_eSPI tft = TFT_eSPI();
 BLEScan* pBLEScan = nullptr;
 
 DetectedDevice devices[MAX_DEVICES];
-int deviceCount = 0;
+int deviceCount = 0;                 // surveillance-only count in devices[]
 int surveillanceCount = 0;
 int totalSurveillanceEver = 0;
 
@@ -209,8 +267,9 @@ int matchOUI(const char* mac) {
 
 // ============ DEVICE TRACKING ============
 
-// Returns true if this is a NEW surveillance device
-bool addDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi) {
+// Update RSSI on an existing surveillance entry in devices[].
+// Returns the index if found, -1 otherwise.
+int updateExistingSurveillance(const char* mac, int8_t rssi, bool isBle, bool isWifi) {
   for (int i = 0; i < deviceCount; i++) {
     if (strncasecmp(devices[i].mac, mac, 17) == 0) {
       devices[i].lastSeen = millis();
@@ -218,36 +277,36 @@ bool addDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi) {
         devices[i].rssi = rssi;
       if (isBle) devices[i].ble = true;
       if (isWifi) devices[i].wifi = true;
-      return false;
+      return i;
     }
   }
-  if (deviceCount >= MAX_DEVICES) return false;
+  return -1;
+}
 
-  int idx = matchOUI(mac);
+// Add a confirmed surveillance device to the devices[] array.
+// Caller must have already inserted into macHash.
+// Returns index into devices[] or -1 if full.
+int addSurveillanceDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi,
+                          const char* vendor, const char* deviceType) {
+  if (deviceCount >= MAX_DEVICES) return -1;
+
   DetectedDevice& d = devices[deviceCount];
   strncpy(d.mac, mac, 17);
   d.mac[17] = '\0';
   d.rssi = rssi;
   d.ble = isBle;
   d.wifi = isWifi;
+  d.vendor = vendor;
+  d.deviceType = deviceType;
   d.firstSeen = millis();
   d.lastSeen = millis();
 
-  if (idx >= 0) {
-    d.vendor = knownSurveillanceOUIs[idx].vendor;
-    d.deviceType = knownSurveillanceOUIs[idx].deviceType;
-    deviceCount++;
-    surveillanceCount++;
-    totalSurveillanceEver++;
-    logToSD(d);
-    return true;
-  } else {
-    d.vendor = NULL;
-    d.deviceType = NULL;
-    deviceCount++;
-    logToSD(d);
-    return false;
-  }
+  int idx = deviceCount;
+  deviceCount++;
+  surveillanceCount++;
+  totalSurveillanceEver++;
+  logToSD(d);
+  return idx;
 }
 
 // ============ DISPLAY ============
@@ -273,9 +332,9 @@ void drawStats() {
   snprintf(buf, sizeof(buf), "%d", totalSurveillanceEver);
   tft.drawCentreString(buf, 100, y + 20, 7);
 
-  // Stats on right side
+  // Stats on right side — totalMacsSeen = all unique MACs (surv + non-surv)
   tft.setTextColor(C6S_SLATE_LIGHT, C6S_NAVY);
-  snprintf(buf, sizeof(buf), "%d", deviceCount);
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)totalMacsSeen);
   tft.drawString("All: ", 220, y + 22, 4);
   tft.drawString(buf, 268, y + 22, 4);
 
@@ -331,9 +390,9 @@ void drawStatusBar() {
 
   char status[50];
   if (sdReady) {
-    snprintf(status, sizeof(status), " BLE+WiFi | %d MACs | SD:%d logged", deviceCount, sdLogCount);
+    snprintf(status, sizeof(status), " BLE+WiFi | %lu MACs | SD:%d logged", (unsigned long)totalMacsSeen, sdLogCount);
   } else {
-    snprintf(status, sizeof(status), " BLE+WiFi | %d MACs | NO SD CARD", deviceCount);
+    snprintf(status, sizeof(status), " BLE+WiFi | %lu MACs | NO SD CARD", (unsigned long)totalMacsSeen);
   }
   tft.drawString(status, 2, y + 1, 2);
 }
@@ -385,33 +444,53 @@ void doBLEScan() {
     }
     int8_t rssi = dev.getRSSI();
 
-    bool isNew = addDevice(mac, rssi, true, false);
+    // --- dedup via hash set ---
+    bool brandNew = macHashInsert(mac);
 
-    // If OUI didn't match, check BLE manufacturer data
-    if (isNew) {
-      int idx = deviceCount - 1;
-      if (!devices[idx].vendor && dev.haveManufacturerData()) {
-        String manufData = dev.getManufacturerData();
-        if (manufData.length() >= 2) {
-          uint16_t companyId = (uint8_t)manufData[0] | ((uint8_t)manufData[1] << 8);
-          int mIdx = matchBLEManufacturer(companyId);
-          if (mIdx >= 0) {
-            devices[idx].vendor = knownBLEManufacturers[mIdx].vendor;
-            devices[idx].deviceType = knownBLEManufacturers[mIdx].deviceType;
-            surveillanceCount++;
-            totalSurveillanceEver++;
-            logToSD(devices[idx]);  // re-log with vendor info
+    if (!brandNew) {
+      // Already seen — just update RSSI on existing surveillance entry (if any)
+      updateExistingSurveillance(mac, rssi, true, false);
+      continue;
+    }
+
+    // New MAC — check OUI first
+    int ouiIdx = matchOUI(mac);
+    if (ouiIdx >= 0) {
+      int dIdx = addSurveillanceDevice(mac, rssi, true, false,
+                    knownSurveillanceOUIs[ouiIdx].vendor,
+                    knownSurveillanceOUIs[ouiIdx].deviceType);
+      if (dIdx >= 0) {
+        flashScreen();
+        addLogEntry(devices[dIdx].vendor, devices[dIdx].deviceType, rssi);
+        drawStats();
+        Serial.printf("[BLE] OUI MATCH: %s %s %s RSSI:%d\n",
+          mac, devices[dIdx].vendor, devices[dIdx].deviceType, rssi);
+      }
+      continue;
+    }
+
+    // No OUI match — check BLE manufacturer data
+    if (dev.haveManufacturerData()) {
+      String manufData = dev.getManufacturerData();
+      if (manufData.length() >= 2) {
+        uint16_t companyId = (uint8_t)manufData[0] | ((uint8_t)manufData[1] << 8);
+        int mIdx = matchBLEManufacturer(companyId);
+        if (mIdx >= 0) {
+          int dIdx = addSurveillanceDevice(mac, rssi, true, false,
+                        knownBLEManufacturers[mIdx].vendor,
+                        knownBLEManufacturers[mIdx].deviceType);
+          if (dIdx >= 0) {
+            flashScreen();
+            addLogEntry(devices[dIdx].vendor, devices[dIdx].deviceType, rssi);
+            drawStats();
             Serial.printf("[BLE] MANUF ID 0x%04X: %s %s RSSI:%d\n",
-              companyId, devices[idx].vendor, devices[idx].deviceType, rssi);
+              companyId, devices[dIdx].vendor, devices[dIdx].deviceType, rssi);
           }
+          continue;
         }
       }
-      if (devices[idx].vendor) {
-        flashScreen();
-        addLogEntry(devices[idx].vendor, devices[idx].deviceType, rssi);
-        drawStats();
-      }
     }
+    // Non-surveillance BLE device — not added to devices[]
   }
   pBLEScan->clearResults();
 }
@@ -428,15 +507,29 @@ void doWifiScan() {
       bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
     int8_t rssi = WiFi.RSSI(i);
 
-    bool isNew = addDevice(macStr, rssi, false, true);
-    if (isNew) {
-      int idx = deviceCount - 1;
-      flashScreen();
-      addLogEntry(devices[idx].vendor, devices[idx].deviceType, rssi);
-      drawStats();
-      Serial.printf("[WiFi] SURVEILLANCE: %s %s %s RSSI:%d\n",
-        macStr, devices[idx].vendor, devices[idx].deviceType, rssi);
+    // --- dedup via hash set ---
+    bool brandNew = macHashInsert(macStr);
+
+    if (!brandNew) {
+      updateExistingSurveillance(macStr, rssi, false, true);
+      continue;
     }
+
+    // New MAC — check OUI
+    int ouiIdx = matchOUI(macStr);
+    if (ouiIdx >= 0) {
+      int dIdx = addSurveillanceDevice(macStr, rssi, false, true,
+                    knownSurveillanceOUIs[ouiIdx].vendor,
+                    knownSurveillanceOUIs[ouiIdx].deviceType);
+      if (dIdx >= 0) {
+        flashScreen();
+        addLogEntry(devices[dIdx].vendor, devices[dIdx].deviceType, rssi);
+        drawStats();
+        Serial.printf("[WiFi] SURVEILLANCE: %s %s %s RSSI:%d\n",
+          macStr, devices[dIdx].vendor, devices[dIdx].deviceType, rssi);
+      }
+    }
+    // Non-surveillance WiFi AP — not added to devices[]
   }
   WiFi.scanDelete();
 }
@@ -447,6 +540,9 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n[FlockFlash] Starting...");
   startTime = millis();
+
+  // Clear the MAC dedup hash table
+  memset(macHashTable, 0, sizeof(macHashTable));
 
   // Display init
   tft.init();

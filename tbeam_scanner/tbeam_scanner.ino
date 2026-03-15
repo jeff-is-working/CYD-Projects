@@ -57,7 +57,7 @@ Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 #define LED_BLINK_MS        100
 
 // ---- Device tracking ----
-#define MAX_DEVICES   300
+#define MAX_DEVICES   100   // surveillance hits only
 
 struct DetectedDevice {
   char mac[18];
@@ -71,13 +71,48 @@ struct DetectedDevice {
   uint32_t timestamp;     // millis
 };
 
+// ---- MAC hash set for dedup (open-addressing, 16-bit fingerprints) ----
+#define MAC_HASH_SIZE  2048           // 2048 * 2 bytes = 4KB RAM
+static uint16_t macHashTable[MAC_HASH_SIZE];  // 0 = empty slot
+static int      totalMacsSeen = 0;
+
+// Compute a 16-bit fingerprint from a MAC string (never returns 0)
+static uint16_t macFingerprint(const char* mac) {
+  uint32_t h = 2166136261u;  // FNV-1a 32-bit
+  for (int i = 0; i < 17 && mac[i]; i++) {
+    uint8_t c = mac[i];
+    if (c >= 'a' && c <= 'z') c -= 32;  // uppercase
+    h ^= c;
+    h *= 16777619u;
+  }
+  uint16_t fp = (uint16_t)((h >> 16) ^ (h & 0xFFFF));
+  return fp ? fp : 1;  // never return 0 (0 = empty sentinel)
+}
+
+// Returns true if MAC was NOT already in the set (i.e. newly inserted)
+static bool macHashInsert(const char* mac) {
+  uint16_t fp = macFingerprint(mac);
+  uint16_t idx = fp & (MAC_HASH_SIZE - 1);  // MAC_HASH_SIZE is power of 2
+  for (int probe = 0; probe < MAC_HASH_SIZE; probe++) {
+    uint16_t slot = (idx + probe) & (MAC_HASH_SIZE - 1);
+    if (macHashTable[slot] == 0) {
+      macHashTable[slot] = fp;
+      return true;   // new entry
+    }
+    if (macHashTable[slot] == fp) {
+      return false;  // already seen (fingerprint match)
+    }
+  }
+  return false;  // table full — treat as seen
+}
+
 // ============ GLOBALS ============
 BLEScan* pBLEScan = nullptr;
 TinyGPSPlus gps;
 
 DetectedDevice devices[MAX_DEVICES];
-int deviceCount = 0;
-int surveillanceCount = 0;
+int deviceCount = 0;       // surveillance-only count (entries in devices[])
+int surveillanceCount = 0;  // alias kept for compatibility
 
 unsigned long lastBleScan = 0;
 unsigned long lastWifiScan = 0;
@@ -148,11 +183,11 @@ void updateOLED() {
   oled.print("S:");
   oled.print(surveillanceCount);
 
-  // Total devices
+  // Total unique MACs seen
   oled.setTextSize(1);
   oled.setCursor(80, 14);
   oled.print("All:");
-  oled.print(deviceCount);
+  oled.print(totalMacsSeen);
 
   // Logged
   oled.setCursor(80, 24);
@@ -281,12 +316,14 @@ void sendJSON(const DetectedDevice& d) {
 }
 
 void sendStatus() {
-  char json[200];
+  char json[256];
   snprintf(json, sizeof(json),
     "{\"type\":\"status\",\"devices\":%d,\"surveillance\":%d,"
+    "\"totalMacs\":%d,"
     "\"gpsValid\":%s,\"sats\":%d,\"lat\":%.6f,\"lon\":%.6f,"
     "\"logged\":%d,\"uptime\":%lu}",
     deviceCount, surveillanceCount,
+    totalMacsSeen,
     gpsValid ? "true" : "false", gpsSats,
     currentLat, currentLon,
     loggedCount,
@@ -336,20 +373,54 @@ int matchOUI(const char* mac) {
 
 // ============ DEVICE TRACKING ============
 
-bool addDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi) {
-  for (int i = 0; i < deviceCount; i++) {
-    if (strncasecmp(devices[i].mac, mac, 17) == 0) {
-      devices[i].timestamp = millis();
-      if (abs(devices[i].rssi - rssi) > 3)
-        devices[i].rssi = rssi;
-      if (isBle) devices[i].ble = true;
-      if (isWifi) devices[i].wifi = true;
-      return false;
+// addDevice — returns true if this is a NEW surveillance device
+// Only surveillance devices are stored in the devices[] array.
+// All MACs are deduped via the hash set so random phones/APs never
+// consume device array slots.
+bool addDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi,
+               const char* overrideVendor = NULL, const char* overrideType = NULL) {
+
+  // --- Step 1: hash-set dedup ---
+  bool isNewMac = macHashInsert(mac);
+
+  if (!isNewMac) {
+    // Already seen — update RSSI on existing surveillance entry if present
+    for (int i = 0; i < deviceCount; i++) {
+      if (strncasecmp(devices[i].mac, mac, 17) == 0) {
+        devices[i].timestamp = millis();
+        if (abs(devices[i].rssi - rssi) > 3)
+          devices[i].rssi = rssi;
+        if (isBle) devices[i].ble = true;
+        if (isWifi) devices[i].wifi = true;
+        return false;
+      }
+    }
+    return false;  // non-surveillance MAC we've seen before
+  }
+
+  // --- Step 2: new MAC — count it ---
+  totalMacsSeen++;
+
+  // --- Step 3: check if surveillance ---
+  const char* vendor = overrideVendor;
+  const char* deviceType = overrideType;
+
+  if (!vendor) {
+    int idx = matchOUI(mac);
+    if (idx >= 0) {
+      vendor = knownSurveillanceOUIs[idx].vendor;
+      deviceType = knownSurveillanceOUIs[idx].deviceType;
     }
   }
+
+  if (!vendor) {
+    // Not surveillance — do NOT add to devices[]
+    return false;
+  }
+
+  // --- Step 4: surveillance hit — add to devices[] array ---
   if (deviceCount >= MAX_DEVICES) return false;
 
-  int idx = matchOUI(mac);
   DetectedDevice& d = devices[deviceCount];
   strncpy(d.mac, mac, 17);
   d.mac[17] = '\0';
@@ -359,32 +430,25 @@ bool addDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi) {
   d.lat = currentLat;
   d.lon = currentLon;
   d.timestamp = millis();
+  d.vendor = vendor;
+  d.deviceType = deviceType;
 
-  if (idx >= 0) {
-    d.vendor = knownSurveillanceOUIs[idx].vendor;
-    d.deviceType = knownSurveillanceOUIs[idx].deviceType;
-    surveillanceCount++;
-  } else {
-    d.vendor = NULL;
-    d.deviceType = NULL;
-  }
   deviceCount++;
+  surveillanceCount++;
 
   logToSPIFFS(d);
   sendJSON(d);
 
-  if (d.vendor) {
-    // Blink LED for surveillance detection
-    digitalWrite(LED_PIN, HIGH);
-    delay(LED_BLINK_MS);
-    digitalWrite(LED_PIN, LOW);
-    // Save for OLED display
-    strncpy(lastSurveillanceVendor, d.vendor, 19);
-    lastSurveillanceVendor[19] = '\0';
-    updateOLED();
-  }
+  // Blink LED for surveillance detection
+  digitalWrite(LED_PIN, HIGH);
+  delay(LED_BLINK_MS);
+  digitalWrite(LED_PIN, LOW);
+  // Save for OLED display
+  strncpy(lastSurveillanceVendor, vendor, 19);
+  lastSurveillanceVendor[19] = '\0';
+  updateOLED();
 
-  return (d.vendor != NULL);
+  return true;
 }
 
 // ============ BLE SCANNING ============
@@ -405,31 +469,35 @@ void doBLEScan() {
     }
     int8_t rssi = dev.getRSSI();
 
-    bool isNew = addDevice(mac, rssi, true, false);
+    // First try OUI match via addDevice (handles hash dedup internally)
+    // Check OUI first
+    int ouiIdx = matchOUI(mac);
+    if (ouiIdx >= 0) {
+      addDevice(mac, rssi, true, false,
+                knownSurveillanceOUIs[ouiIdx].vendor,
+                knownSurveillanceOUIs[ouiIdx].deviceType);
+      continue;
+    }
 
-    // If OUI didn't match, check BLE manufacturer data
-    if (isNew) {
-      int idx = deviceCount - 1;
-      if (!devices[idx].vendor && dev.haveManufacturerData()) {
-        String manufData = dev.getManufacturerData();
-        if (manufData.length() >= 2) {
-          uint16_t companyId = (uint8_t)manufData[0] | ((uint8_t)manufData[1] << 8);
-          int mIdx = matchBLEManufacturer(companyId);
-          if (mIdx >= 0) {
-            devices[idx].vendor = knownBLEManufacturers[mIdx].vendor;
-            devices[idx].deviceType = knownBLEManufacturers[mIdx].deviceType;
-            surveillanceCount++;
-            logToSPIFFS(devices[idx]);
-            sendJSON(devices[idx]);
-            strncpy(lastSurveillanceVendor, devices[idx].vendor, 19);
-            lastSurveillanceVendor[19] = '\0';
-            updateOLED();
-            Serial.printf("[BLE] MANUF ID 0x%04X: %s %s RSSI:%d\n",
-              companyId, devices[idx].vendor, devices[idx].deviceType, rssi);
-          }
+    // No OUI match — check BLE manufacturer data before consuming hash slot
+    const char* bleVendor = NULL;
+    const char* bleType = NULL;
+    if (dev.haveManufacturerData()) {
+      String manufData = dev.getManufacturerData();
+      if (manufData.length() >= 2) {
+        uint16_t companyId = (uint8_t)manufData[0] | ((uint8_t)manufData[1] << 8);
+        int mIdx = matchBLEManufacturer(companyId);
+        if (mIdx >= 0) {
+          bleVendor = knownBLEManufacturers[mIdx].vendor;
+          bleType   = knownBLEManufacturers[mIdx].deviceType;
+          Serial.printf("[BLE] MANUF ID 0x%04X: %s %s RSSI:%d\n",
+            companyId, bleVendor, bleType, rssi);
         }
       }
     }
+
+    // addDevice handles hash dedup + only stores if surveillance
+    addDevice(mac, rssi, true, false, bleVendor, bleType);
   }
   pBLEScan->clearResults();
 }
@@ -482,6 +550,9 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n[T-Beam Scanner] Starting...");
   startTime = millis();
+
+  // Clear MAC hash table
+  memset(macHashTable, 0, sizeof(macHashTable));
 
   // LED
   pinMode(LED_PIN, OUTPUT);
