@@ -164,6 +164,32 @@ void logToSD(const DetectedDevice& d) {
   sdLogCount++;
 }
 
+// ============ BLE MANUFACTURER ID TABLE ============
+
+struct BLEManufEntry {
+  uint16_t companyId;
+  const char* vendor;
+  const char* deviceType;
+};
+
+BLEManufEntry knownBLEManufacturers[] = {
+  {0x09C8, "Flock Safety", "ALPR Camera"},     // XUNTONG — Flock hardware
+  {0x004C, "Apple", ""},                        // Apple (not surveillance, for reference)
+  {0x0000, NULL, NULL}                          // Terminator
+};
+
+// Check BLE manufacturer data for known surveillance company IDs
+// Returns index into knownBLEManufacturers or -1
+int matchBLEManufacturer(uint16_t companyId) {
+  for (int i = 0; knownBLEManufacturers[i].vendor != NULL; i++) {
+    if (knownBLEManufacturers[i].companyId == companyId &&
+        knownBLEManufacturers[i].deviceType[0] != '\0') {  // skip non-surveillance
+      return i;
+    }
+  }
+  return -1;
+}
+
 // ============ OUI MATCHING ============
 
 int matchOUI(const char* mac) {
@@ -354,21 +380,36 @@ void doBLEScan() {
     char mac[18];
     strncpy(mac, macStr.c_str(), 17);
     mac[17] = '\0';
-    // uppercase
     for (int j = 0; j < 17 && mac[j]; j++) {
       if (mac[j] >= 'a' && mac[j] <= 'z') mac[j] -= 32;
     }
     int8_t rssi = dev.getRSSI();
 
     bool isNew = addDevice(mac, rssi, true, false);
+
+    // If OUI didn't match, check BLE manufacturer data
     if (isNew) {
       int idx = deviceCount - 1;
+      if (!devices[idx].vendor && dev.haveManufacturerData()) {
+        String manufData = dev.getManufacturerData();
+        if (manufData.length() >= 2) {
+          uint16_t companyId = (uint8_t)manufData[0] | ((uint8_t)manufData[1] << 8);
+          int mIdx = matchBLEManufacturer(companyId);
+          if (mIdx >= 0) {
+            devices[idx].vendor = knownBLEManufacturers[mIdx].vendor;
+            devices[idx].deviceType = knownBLEManufacturers[mIdx].deviceType;
+            surveillanceCount++;
+            totalSurveillanceEver++;
+            logToSD(devices[idx]);  // re-log with vendor info
+            Serial.printf("[BLE] MANUF ID 0x%04X: %s %s RSSI:%d\n",
+              companyId, devices[idx].vendor, devices[idx].deviceType, rssi);
+          }
+        }
+      }
       if (devices[idx].vendor) {
         flashScreen();
         addLogEntry(devices[idx].vendor, devices[idx].deviceType, rssi);
         drawStats();
-        Serial.printf("[BLE] SURVEILLANCE: %s %s %s RSSI:%d\n",
-          mac, devices[idx].vendor, devices[idx].deviceType, rssi);
       }
     }
   }

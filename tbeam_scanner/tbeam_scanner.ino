@@ -296,6 +296,27 @@ void sendStatus() {
   Serial2.println(json);
 }
 
+// ============ BLE MANUFACTURER ID TABLE ============
+
+struct BLEManufEntry {
+  uint16_t companyId;
+  const char* vendor;
+  const char* deviceType;
+};
+
+BLEManufEntry knownBLEManufacturers[] = {
+  {0x09C8, "Flock Safety", "ALPR Camera"},     // XUNTONG — Flock hardware
+  {0x0000, NULL, NULL}                          // Terminator
+};
+
+int matchBLEManufacturer(uint16_t companyId) {
+  for (int i = 0; knownBLEManufacturers[i].vendor != NULL; i++) {
+    if (knownBLEManufacturers[i].companyId == companyId)
+      return i;
+  }
+  return -1;
+}
+
 // ============ OUI MATCHING ============
 
 int matchOUI(const char* mac) {
@@ -382,7 +403,33 @@ void doBLEScan() {
     for (int j = 0; j < 17 && mac[j]; j++) {
       if (mac[j] >= 'a' && mac[j] <= 'z') mac[j] -= 32;
     }
-    addDevice(mac, dev.getRSSI(), true, false);
+    int8_t rssi = dev.getRSSI();
+
+    bool isNew = addDevice(mac, rssi, true, false);
+
+    // If OUI didn't match, check BLE manufacturer data
+    if (isNew) {
+      int idx = deviceCount - 1;
+      if (!devices[idx].vendor && dev.haveManufacturerData()) {
+        String manufData = dev.getManufacturerData();
+        if (manufData.length() >= 2) {
+          uint16_t companyId = (uint8_t)manufData[0] | ((uint8_t)manufData[1] << 8);
+          int mIdx = matchBLEManufacturer(companyId);
+          if (mIdx >= 0) {
+            devices[idx].vendor = knownBLEManufacturers[mIdx].vendor;
+            devices[idx].deviceType = knownBLEManufacturers[mIdx].deviceType;
+            surveillanceCount++;
+            logToSPIFFS(devices[idx]);
+            sendJSON(devices[idx]);
+            strncpy(lastSurveillanceVendor, devices[idx].vendor, 19);
+            lastSurveillanceVendor[19] = '\0';
+            updateOLED();
+            Serial.printf("[BLE] MANUF ID 0x%04X: %s %s RSSI:%d\n",
+              companyId, devices[idx].vendor, devices[idx].deviceType, rssi);
+          }
+        }
+      }
+    }
   }
   pBLEScan->clearResults();
 }
