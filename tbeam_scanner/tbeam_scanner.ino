@@ -31,7 +31,16 @@
 #include <WiFi.h>
 #include <SPIFFS.h>
 #include <TinyGPSPlus.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include "oui_database.h"
+
+// ---- OLED Display (T-Beam I2C: SDA=21, SCL=22) ----
+#define OLED_WIDTH    128
+#define OLED_HEIGHT    64
+#define OLED_ADDR     0x3C
+Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
 // ---- T-Beam v1.2 pins ----
 #define GPS_RX_PIN        34    // GPS module TX -> ESP32 RX
@@ -85,6 +94,100 @@ int gpsSats = 0;
 const char* logFilename = "/scan_log.csv";
 bool spiffsReady = false;
 int loggedCount = 0;
+
+// OLED state
+bool oledReady = false;
+unsigned long lastOledUpdate = 0;
+char lastSurveillanceVendor[20] = "";
+
+// ============ OLED DISPLAY ============
+
+bool initOLED() {
+  Wire.begin(21, 22);
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("[OLED] Init failed");
+    return false;
+  }
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);
+  oled.println("FLOCK FLASH");
+  oled.println("T-Beam Scanner");
+  oled.println("");
+  oled.println("Initializing...");
+  oled.display();
+  return true;
+}
+
+void updateOLED() {
+  if (!oledReady) return;
+
+  oled.clearDisplay();
+
+  // Title bar
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);
+  oled.print("FLOCK FLASH");
+
+  // Uptime
+  unsigned long elapsed = (millis() - startTime) / 1000;
+  int mins = elapsed / 60;
+  int secs = elapsed % 60;
+  char timeBuf[10];
+  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", mins, secs);
+  oled.setCursor(80, 0);
+  oled.print(timeBuf);
+
+  // Divider
+  oled.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+  // Surveillance count (big)
+  oled.setTextSize(2);
+  oled.setCursor(0, 14);
+  oled.print("S:");
+  oled.print(surveillanceCount);
+
+  // Total devices
+  oled.setTextSize(1);
+  oled.setCursor(80, 14);
+  oled.print("All:");
+  oled.print(deviceCount);
+
+  // Logged
+  oled.setCursor(80, 24);
+  oled.print("Log:");
+  oled.print(loggedCount);
+
+  // Divider
+  oled.drawLine(0, 34, 127, 34, SSD1306_WHITE);
+
+  // GPS status
+  oled.setCursor(0, 38);
+  if (gpsValid) {
+    oled.print("GPS:");
+    oled.print(gpsSats);
+    oled.print("sat ");
+    oled.print(currentLat, 4);
+    oled.setCursor(0, 48);
+    oled.print("    ");
+    oled.print(currentLon, 4);
+  } else {
+    oled.print("GPS: searching...");
+  }
+
+  // Last surveillance hit
+  if (lastSurveillanceVendor[0]) {
+    oled.setCursor(0, 56);
+    oled.print("! ");
+    oled.print(lastSurveillanceVendor);
+  } else {
+    oled.setCursor(0, 56);
+    oled.print(spiffsReady ? "SPIFFS OK" : "NO SPIFFS");
+  }
+
+  oled.display();
+}
 
 // ============ GPS ============
 
@@ -254,6 +357,10 @@ bool addDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi) {
     digitalWrite(LED_PIN, HIGH);
     delay(LED_BLINK_MS);
     digitalWrite(LED_PIN, LOW);
+    // Save for OLED display
+    strncpy(lastSurveillanceVendor, d.vendor, 19);
+    lastSurveillanceVendor[19] = '\0';
+    updateOLED();
   }
 
   return (d.vendor != NULL);
@@ -333,6 +440,9 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
+  // OLED display
+  oledReady = initOLED();
+
   // GPS on Serial1
   Serial1.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
@@ -363,6 +473,8 @@ void setup() {
 
   Serial.println("[T-Beam Scanner] Ready. Scanning...");
   Serial.println("[T-Beam Scanner] Commands: 'dump' = download log, 'clear' = erase log");
+
+  updateOLED();
 }
 
 // ============ LOOP ============
@@ -385,10 +497,11 @@ void loop() {
     doWifiScan();
   }
 
-  // Status update every 10 seconds
-  if (now - lastGpsUpdate >= 10000) {
+  // Status update every 5 seconds
+  if (now - lastGpsUpdate >= 5000) {
     lastGpsUpdate = now;
     sendStatus();
+    updateOLED();
   }
 
   // Serial commands
