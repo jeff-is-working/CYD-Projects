@@ -4,7 +4,7 @@
   Date:     14 Mar 2026
   Hardware: ESP32 CYD (Cheap Yellow Display) with ILI9341 320x240
   Software: Arduino IDE / arduino-cli
-            TFT_eSPI, BLE, WiFi
+            TFT_eSPI, BLE, WiFi, SD
   License:  GPL-3.0
   Based on: OUI-spy-TOO by colonelpanichacks / Circle Six Consulting
 
@@ -12,6 +12,7 @@
     Standalone passive BLE + WiFi scanner that detects Flock Safety
     ALPR cameras and other surveillance devices by MAC prefix (OUI).
     Displays a running count and log on the CYD screen.
+    Logs all detected MACs to SD card as CSV.
     No Pi required — fully self-contained.
 
     Educational / security research tool. Passive receive-only.
@@ -22,6 +23,8 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <WiFi.h>
+#include <SD.h>
+#include <SPI.h>
 #include "oui_database.h"
 
 // ---- C6S "Warm & Grounded" palette (RGB565) ----
@@ -37,9 +40,15 @@
 // ---- Display ----
 #define SCREEN_ORIENTATION  1       // landscape, cable right
 
+// ---- SD Card (VSPI bus, separate from TFT's HSPI) ----
+#define SD_CS               5
+#define SD_MOSI            23
+#define SD_MISO            19
+#define SD_SCLK            18
+
 // ---- Scan Timing ----
-#define BLE_SCAN_TIME       5       // seconds per BLE scan
-#define BLE_SCAN_INTERVAL   8000    // ms between BLE scans
+#define BLE_SCAN_TIME       1       // seconds per BLE scan (short to keep display responsive)
+#define BLE_SCAN_INTERVAL   5000    // ms between BLE scans
 #define WIFI_SCAN_INTERVAL  10000   // ms between WiFi scans
 
 // ---- RSSI thresholds ----
@@ -61,6 +70,8 @@ struct DetectedDevice {
   uint32_t lastSeen;
 };
 
+// (no BLE queue needed — using post-scan iteration instead of callbacks)
+
 // ============ GLOBALS ============
 TFT_eSPI tft = TFT_eSPI();
 BLEScan* pBLEScan = nullptr;
@@ -68,7 +79,7 @@ BLEScan* pBLEScan = nullptr;
 DetectedDevice devices[MAX_DEVICES];
 int deviceCount = 0;
 int surveillanceCount = 0;
-int totalSurveillanceEver = 0;    // total unique surveillance devices seen
+int totalSurveillanceEver = 0;
 
 unsigned long lastBleScan = 0;
 unsigned long lastWifiScan = 0;
@@ -77,12 +88,81 @@ unsigned long startTime = 0;
 bool flashActive = false;
 unsigned long flashStart = 0;
 
+// SD card state
+SPIClass sdSPI(VSPI);
+bool sdReady = false;
+const char* logFilename = "/flock_log.csv";
+int sdLogCount = 0;
+
 // Log display: rolling list of last N detections
-#define LOG_LINES     7
-#define LOG_Y_START   95
+#define LOG_LINES     6
+#define LOG_Y_START   118
 #define LOG_LINE_H    20
 String logEntries[LOG_LINES];
 int logCount = 0;
+
+// ============ SD CARD ============
+
+bool initSD() {
+  sdSPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSPI)) {
+    Serial.println("[SD] No card detected");
+    return false;
+  }
+
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("[SD] No card detected");
+    return false;
+  }
+
+  const char* typeStr = "UNKNOWN";
+  if (cardType == CARD_MMC) typeStr = "MMC";
+  else if (cardType == CARD_SD) typeStr = "SD";
+  else if (cardType == CARD_SDHC) typeStr = "SDHC";
+
+  Serial.printf("[SD] Card: %s, Size: %lluMB\n", typeStr, SD.cardSize() / (1024 * 1024));
+
+  // Write CSV header only if file doesn't exist yet
+  bool isNew = !SD.exists(logFilename);
+  File f = SD.open(logFilename, FILE_APPEND);
+  if (!f) {
+    Serial.println("[SD] Failed to open log file");
+    return false;
+  }
+  if (isNew) {
+    f.println("elapsed_sec,vendor,device_type,mac,rssi,ble,wifi,surveillance");
+  }
+  f.println("# --- session start ---");
+  f.close();
+
+  Serial.printf("[SD] Logging to %s\n", logFilename);
+  return true;
+}
+
+void logToSD(const DetectedDevice& d) {
+  if (!sdReady) return;
+
+  File f = SD.open(logFilename, FILE_APPEND);
+  if (!f) {
+    Serial.println("[SD] Write failed");
+    return;
+  }
+
+  unsigned long elapsed = (millis() - startTime) / 1000;
+  bool isSurveillance = (d.vendor != NULL);
+  f.printf("%lu,%s,%s,%s,%d,%d,%d,%d\n",
+    elapsed,
+    d.vendor ? d.vendor : "",
+    d.deviceType ? d.deviceType : "",
+    d.mac,
+    d.rssi,
+    d.ble ? 1 : 0,
+    d.wifi ? 1 : 0,
+    isSurveillance ? 1 : 0);
+  f.close();
+  sdLogCount++;
+}
 
 // ============ OUI MATCHING ============
 
@@ -90,7 +170,6 @@ int matchOUI(const char* mac) {
   char prefix[9];
   strncpy(prefix, mac, 8);
   prefix[8] = '\0';
-  // uppercase
   for (int i = 0; i < 8; i++) {
     if (prefix[i] >= 'a' && prefix[i] <= 'z')
       prefix[i] -= 32;
@@ -106,7 +185,6 @@ int matchOUI(const char* mac) {
 
 // Returns true if this is a NEW surveillance device
 bool addDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi) {
-  // Check if already seen
   for (int i = 0; i < deviceCount; i++) {
     if (strncasecmp(devices[i].mac, mac, 17) == 0) {
       devices[i].lastSeen = millis();
@@ -114,12 +192,11 @@ bool addDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi) {
         devices[i].rssi = rssi;
       if (isBle) devices[i].ble = true;
       if (isWifi) devices[i].wifi = true;
-      return false;  // already known
+      return false;
     }
   }
   if (deviceCount >= MAX_DEVICES) return false;
 
-  // New device
   int idx = matchOUI(mac);
   DetectedDevice& d = devices[deviceCount];
   strncpy(d.mac, mac, 17);
@@ -136,11 +213,13 @@ bool addDevice(const char* mac, int8_t rssi, bool isBle, bool isWifi) {
     deviceCount++;
     surveillanceCount++;
     totalSurveillanceEver++;
-    return true;  // new surveillance device!
+    logToSD(d);
+    return true;
   } else {
     d.vendor = NULL;
     d.deviceType = NULL;
     deviceCount++;
+    logToSD(d);
     return false;
   }
 }
@@ -154,23 +233,25 @@ void drawHeader() {
 }
 
 void drawStats() {
-  int y = 36;
-  // Big counter
-  tft.fillRect(0, y, 319, 55, C6S_NAVY);
-  tft.setTextColor(C6S_ACCENT, C6S_NAVY);
-  tft.drawCentreString("SURVEILLANCE DETECTED", 160, y, 2);
+  int y = 32;
+  tft.fillRect(0, y, 319, 64, C6S_NAVY);
+
+  // Label with subtle background bar
+  tft.fillRect(4, y, 311, 16, C6S_NAVY_LIGHT);
+  tft.setTextColor(C6S_ACCENT, C6S_NAVY_LIGHT);
+  tft.drawCentreString("SURVEILLANCE DETECTED", 160, y + 1, 2);
 
   // Large number
   tft.setTextColor(C6S_WHITE, C6S_NAVY);
   char buf[8];
   snprintf(buf, sizeof(buf), "%d", totalSurveillanceEver);
-  tft.drawCentreString(buf, 110, y + 16, 7);
+  tft.drawCentreString(buf, 100, y + 20, 7);
 
   // Stats on right side
   tft.setTextColor(C6S_SLATE_LIGHT, C6S_NAVY);
   snprintf(buf, sizeof(buf), "%d", deviceCount);
-  tft.drawString("All: ", 220, y + 16, 4);
-  tft.drawString(buf, 268, y + 16, 4);
+  tft.drawString("All: ", 220, y + 22, 4);
+  tft.drawString(buf, 268, y + 22, 4);
 
   // Uptime
   unsigned long elapsed = (millis() - startTime) / 1000;
@@ -178,24 +259,22 @@ void drawStats() {
   int secs = elapsed % 60;
   char timeBuf[12];
   snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", mins, secs);
-  tft.drawString(timeBuf, 232, y + 42, 2);
+  tft.drawString(timeBuf, 232, y + 48, 2);
 }
 
 void drawLogHeader() {
-  tft.fillRoundRect(0, 83, 319, 18, 5, C6S_NAVY_LIGHT);
+  tft.fillRoundRect(0, 98, 319, 18, 5, C6S_NAVY_LIGHT);
   tft.setTextColor(C6S_WHITE, C6S_NAVY_LIGHT);
-  tft.drawString(" VENDOR          TYPE           RSSI", 4, 85, 2);
+  tft.drawString(" VENDOR          TYPE           RSSI", 4, 100, 2);
 }
 
 void addLogEntry(const char* vendor, const char* deviceType, int8_t rssi) {
   char entry[52];
-  // Truncate vendor and type to fit
   char vBuf[17], tBuf[15];
   strncpy(vBuf, vendor, 16); vBuf[16] = '\0';
   strncpy(tBuf, deviceType, 14); tBuf[14] = '\0';
   snprintf(entry, sizeof(entry), "%-16s %-14s %ddB", vBuf, tBuf, rssi);
 
-  // Scroll log up
   if (logCount >= LOG_LINES) {
     for (int i = 0; i < LOG_LINES - 1; i++)
       logEntries[i] = logEntries[i + 1];
@@ -212,7 +291,6 @@ void drawLog() {
     int y = LOG_Y_START + (i * LOG_LINE_H) + 8;
     tft.fillRect(0, y, 319, LOG_LINE_H, C6S_NAVY);
     if (i < logCount) {
-      // Color by recency: newest = accent, older = slate
       uint16_t color = (i == logCount - 1) ? C6S_ACCENT : C6S_SLATE_LIGHT;
       tft.setTextColor(color, C6S_NAVY);
       tft.drawString(logEntries[i], 4, y + 2, 2);
@@ -225,14 +303,16 @@ void drawStatusBar() {
   tft.fillRect(0, y, 319, 15, C6S_NAVY_LIGHT);
   tft.setTextColor(C6S_SLATE_LIGHT, C6S_NAVY_LIGHT);
 
-  // Scanning indicator
-  char status[40];
-  snprintf(status, sizeof(status), " BLE+WiFi scanning   |   %d total MACs", deviceCount);
+  char status[50];
+  if (sdReady) {
+    snprintf(status, sizeof(status), " BLE+WiFi | %d MACs | SD:%d logged", deviceCount, sdLogCount);
+  } else {
+    snprintf(status, sizeof(status), " BLE+WiFi | %d MACs | NO SD CARD", deviceCount);
+  }
   tft.drawString(status, 2, y + 1, 2);
 }
 
 void flashScreen() {
-  // Brief red border flash to alert on new surveillance device
   flashActive = true;
   flashStart = millis();
   for (int i = 0; i < 4; i++) {
@@ -246,7 +326,6 @@ void clearFlash() {
     for (int i = 0; i < 4; i++) {
       tft.drawRect(i, i, 319 - 2*i, 239 - 2*i, C6S_NAVY);
     }
-    // Redraw borders that overlap
     tft.drawRoundRect(0, 0, 319, 239, 10, C6S_NAVY_MID);
   }
 }
@@ -261,35 +340,40 @@ void drawFullScreen() {
   drawStatusBar();
 }
 
-// ============ BLE SCAN CALLBACK ============
+// ============ BLE SCANNING ============
+// No callbacks — do a blocking scan then iterate results on main core.
 
-class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) {
-    const char* mac = advertisedDevice.getAddress().toString().c_str();
-    int8_t rssi = advertisedDevice.getRSSI();
+void doBLEScan() {
+  BLEScanResults* results = pBLEScan->start(BLE_SCAN_TIME, false);
+  if (!results) return;
+  int count = results->getCount();
 
-    // Format MAC with colons uppercase
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%s", mac);
-    for (int i = 0; i < 17 && macStr[i]; i++) {
-      if (macStr[i] >= 'a' && macStr[i] <= 'z')
-        macStr[i] -= 32;
-      if (macStr[i] == ':' || (i % 3 == 2))
-        ; // keep colons
+  for (int i = 0; i < count; i++) {
+    BLEAdvertisedDevice dev = results->getDevice(i);
+    String macStr = dev.getAddress().toString();
+    char mac[18];
+    strncpy(mac, macStr.c_str(), 17);
+    mac[17] = '\0';
+    // uppercase
+    for (int j = 0; j < 17 && mac[j]; j++) {
+      if (mac[j] >= 'a' && mac[j] <= 'z') mac[j] -= 32;
     }
+    int8_t rssi = dev.getRSSI();
 
-    bool isNew = addDevice(macStr, rssi, true, false);
+    bool isNew = addDevice(mac, rssi, true, false);
     if (isNew) {
       int idx = deviceCount - 1;
-      flashScreen();
-      addLogEntry(devices[idx].vendor, devices[idx].deviceType, rssi);
-      drawStats();
-
-      Serial.printf("[BLE] NEW SURVEILLANCE: %s %s %s RSSI:%d\n",
-        macStr, devices[idx].vendor, devices[idx].deviceType, rssi);
+      if (devices[idx].vendor) {
+        flashScreen();
+        addLogEntry(devices[idx].vendor, devices[idx].deviceType, rssi);
+        drawStats();
+        Serial.printf("[BLE] SURVEILLANCE: %s %s %s RSSI:%d\n",
+          mac, devices[idx].vendor, devices[idx].deviceType, rssi);
+      }
     }
   }
-};
+  pBLEScan->clearResults();
+}
 
 // ============ WIFI SCANNING ============
 
@@ -309,8 +393,7 @@ void doWifiScan() {
       flashScreen();
       addLogEntry(devices[idx].vendor, devices[idx].deviceType, rssi);
       drawStats();
-
-      Serial.printf("[WiFi] NEW SURVEILLANCE: %s %s %s RSSI:%d\n",
+      Serial.printf("[WiFi] SURVEILLANCE: %s %s %s RSSI:%d\n",
         macStr, devices[idx].vendor, devices[idx].deviceType, rssi);
     }
   }
@@ -332,29 +415,40 @@ void setup() {
   // Startup splash
   tft.fillScreen(C6S_NAVY);
   tft.setTextColor(C6S_ACCENT, C6S_NAVY);
-  tft.drawCentreString("FLOCK FLASH", 160, 60, 4);
+  tft.drawCentreString("FLOCK FLASH", 160, 50, 4);
   tft.setTextColor(C6S_SLATE_LIGHT, C6S_NAVY);
-  tft.drawCentreString("Surveillance Scanner", 160, 100, 2);
-  tft.drawCentreString("Initializing BLE + WiFi...", 160, 130, 2);
-  tft.setTextColor(C6S_NAVY_MID, C6S_NAVY);
-  tft.drawCentreString("Passive receive-only", 160, 180, 2);
-  tft.drawCentreString("Educational / research use", 160, 200, 2);
+  tft.drawCentreString("Surveillance Scanner", 160, 85, 2);
 
-  // BLE init
-  BLEDevice::init(""); // no name, passive
+  // SD card init
+  tft.drawCentreString("Checking SD card...", 160, 115, 2);
+  sdReady = initSD();
+  if (sdReady) {
+    tft.setTextColor(C6S_ACCENT, C6S_NAVY);
+    tft.drawCentreString("SD OK - logging to flock_log.csv", 160, 135, 2);
+  } else {
+    tft.setTextColor(C6S_ORANGE, C6S_NAVY);
+    tft.drawCentreString("NO SD CARD - logging disabled", 160, 135, 2);
+  }
+
+  // BLE + WiFi init
+  tft.setTextColor(C6S_SLATE_LIGHT, C6S_NAVY);
+  tft.drawCentreString("Initializing BLE + WiFi...", 160, 165, 2);
+
+  BLEDevice::init("");
   pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new ScanCallbacks(), false);
   pBLEScan->setActiveScan(true);
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
 
-  // WiFi init (station mode, no connection — just scanning)
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  delay(2000);
+  tft.setTextColor(C6S_NAVY_MID, C6S_NAVY);
+  tft.drawCentreString("Passive receive-only", 160, 200, 2);
+  tft.drawCentreString("Educational / research use", 160, 218, 2);
 
-  // Main screen
+  delay(2500);
+
   drawFullScreen();
   Serial.println("[FlockFlash] Ready. Scanning...");
 }
@@ -364,15 +458,14 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // BLE scan
+  // BLE scan (blocking, then iterate results — all on main core)
   if (now - lastBleScan >= BLE_SCAN_INTERVAL) {
     lastBleScan = now;
-    pBLEScan->start(BLE_SCAN_TIME, false);
-    pBLEScan->clearResults();
+    doBLEScan();
   }
 
-  // WiFi scan
-  if (now - lastWifiScan >= WIFI_SCAN_INTERVAL) {
+  // WiFi scan (skip if BLE scan is active to avoid coexistence issues)
+  if (now - lastWifiScan >= WIFI_SCAN_INTERVAL && !pBLEScan->isScanning()) {
     lastWifiScan = now;
     doWifiScan();
   }
@@ -384,7 +477,6 @@ void loop() {
     drawStatusBar();
   }
 
-  // Clear flash effect
   clearFlash();
 
   delay(10);
