@@ -1,0 +1,106 @@
+{
+  "meta": {
+    "source": "tbeam_scanner",
+    "dump_time": "2026-03-20T21:37:47.809063+00:00",
+    "total_records": 3,
+    "surveillance_records": 3,
+    "exported": 3,
+    "with_gps": 3,
+    "without_gps": 0
+  },
+  "osm_nodes": [
+    {
+      "lat": 47.02663,
+      "lon": -122.929042,
+      "tags": {
+        "man_made": "surveillance",
+        "surveillance:type": "camera",
+        "surveillance": "outdoor",
+        "surveillance:zone": "traffic",
+        "camera:type": "fixed",
+        "manufacturer": "Ubiquiti",
+        "description": "Network Camera"
+      },
+      "_meta": {
+        "mac": "78:8A:20:B1:BC:E1",
+        "rssi": -90,
+        "detection": "WiFi",
+        "source": "tbeam_scanner",
+        "session": 2
+      }
+    },
+    {
+      "lat": 46.977212,
+      "lon": -123.596846,
+      "tags": {
+        "man_made": "surveillance",
+        "surveillance:type": "camera",
+        "surveillance": "outdoor",
+        "surveillance:zone": "traffic",
+        "camera:type": "fixed",
+        "manufacturer": "Ubiquiti",
+        "description": "Network Camera"
+      },
+      "_meta": {
+        "mac": "B4:FB:E4:14:83:18",
+        "rssi": -92,
+        "detection": "WiFi",
+        "source": "tbeam_scanner",
+        "session": 2
+      }
+    },
+    {
+      "lat": 46.977509,
+      "lon": -123.799397,
+      "tags": {
+        "man_made": "surveillance",
+        "surveillance:type": "ALPR",
+        "surveillance": "outdoor",
+        "surveillance:zone": "traffic",
+        "camera:type": "fixed",
+        "manufacturer": "Flock Safety",
+        "description": "ALPR Camera"
+      },
+      "_meta": {
+        "mac": "E3:1F:7E:18:53:E2",
+        "rssi": -99,
+        "detection": "BLE",
+        "source": "tbeam_scanner",
+        "session": 2
+      }
+    }
+  ],
+  "atlas_rows": [
+    {
+      "lat": 47.02663,
+      "lon": -122.929042,
+      "technology": "Video Surveillance",
+      "vendor": "Ubiquiti",
+      "device_type": "Network Camera",
+      "mac": "78:8A:20:B1:BC:E1",
+      "detection": "WiFi",
+      "rssi": -90
+    },
+    {
+      "lat": 46.977212,
+      "lon": -123.596846,
+      "technology": "Video Surveillance",
+      "vendor": "Ubiquiti",
+      "device_type": "Network Camera",
+      "mac": "B4:FB:E4:14:83:18",
+      "detection": "WiFi",
+      "rssi": -92
+    },
+    {
+      "lat": 46.977509,
+      "lon": -123.799397,
+      "technology": "Automated License Plate Readers",
+      "vendor": "Flock Safety",
+      "device_type": "ALPR Camera",
+      "mac": "E3:1F:7E:18:53:E2",
+      "detection": "BLE",
+      "rssi": -99
+    }
+  ],
+  "no_gps": []
+}

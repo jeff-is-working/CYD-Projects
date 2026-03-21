@@ -1,0 +1,8 @@
+elapsed_sec,lat,lon,vendor,device_type,mac,rssi,ble,wifi,surveillance
+# --- session start ---
+# --- session start ---
+3228,47.026630,-122.929042,Ubiquiti,Network Camera,78:8A:20:B1:BC:E1,-90,0,1,1
+5806,46.977212,-123.596846,Ubiquiti,Network Camera,B4:FB:E4:14:83:18,-92,0,1,1
+6487,46.977509,-123.799397,Flock Safety,ALPR Camera,E3:1F:7E:18:53:E2,-99,1,0,1
+# --- session start ---
+# --- session start ---
