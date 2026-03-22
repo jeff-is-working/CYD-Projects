@@ -1,0 +1,92 @@
+name: Weekly Documentation Refresh
+
+on:
+  schedule:
+    # Every Sunday at 3:17 AM UTC (Saturday 7:17 PM Pacific)
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh-docs:
+    name: Run enterprise-docs refresh
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run enterprise documentation refresh
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude -p --model sonnet "You are running an automated weekly documentation refresh. \
+            Analyze this repository and update all enterprise documentation in the docs/ directory. \
+            Focus on: \
+            1. README.md - ensure it accurately reflects current project state \
+            2. docs/SBOM.md - update dependency inventory if dependency files changed \
+            3. docs/ARCHITECTURE.md - update if code structure changed \
+            4. docs/API.md - update if API surfaces changed \
+            5. docs/DEPLOYMENT.md - update if infra/deploy configs changed \
+            6. docs/SECURITY.md - update if security-relevant code changed \
+            Only update files that already exist or that are clearly needed based on \
+            the project's complexity. Do not create documentation for trivial repos \
+            with fewer than 5 source files. \
+            Use YAML frontmatter with title, scope, and last_updated on every doc. \
+            Do NOT include emoji or unicode symbols. \
+            After updating, provide a brief summary of what changed."
+
+      - name: Check for changes
+        id: changes
+        run: |
+          git add -A docs/ README.md
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="auto/weekly-docs-$(date +%Y-%m-%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -m "docs: weekly documentation refresh [automated]"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --title "docs: weekly documentation refresh $(date +%Y-%m-%d)" \
+            --body "$(cat <<'EOF'
+          ## Summary
+
+          Automated weekly documentation refresh powered by Claude Code.
+
+          This PR updates enterprise documentation to reflect the current state of the codebase. Review the changes to ensure accuracy before merging.
+
+          ## What was checked
+
+          - README.md
+          - docs/SBOM.md (dependency inventory)
+          - docs/ARCHITECTURE.md
+          - docs/API.md
+          - docs/DEPLOYMENT.md
+          - docs/SECURITY.md
+
+          ---
+          *Generated automatically by the weekly-docs workflow*
+          EOF
+          )" \
+            --base main \
+            --head "$BRANCH"

@@ -1,0 +1,75 @@
+name: Update SBOM
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/SBOM.md'
+      - 'SBOM.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-sbom:
+    name: Regenerate SBOM.md
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for dependency files
+        id: deps
+        run: |
+          has_deps=false
+          for f in package.json package-lock.json pnpm-lock.yaml yarn.lock \
+                   requirements.txt pyproject.toml Pipfile setup.py setup.cfg \
+                   go.mod Cargo.toml Gemfile composer.json; do
+            if [ -f "$f" ]; then
+              has_deps=true
+              break
+            fi
+          done
+          echo "found=$has_deps" >> "$GITHUB_OUTPUT"
+
+      - name: Install Claude Code
+        if: steps.deps.outputs.found == 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Generate SBOM.md
+        if: steps.deps.outputs.found == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Determine SBOM location (prefer docs/ if it exists)
+          if [ -d "docs" ]; then
+            SBOM_PATH="docs/SBOM.md"
+          else
+            SBOM_PATH="SBOM.md"
+          fi
+
+          claude -p --model sonnet "Analyze all dependency/package files in this repository \
+            (package.json, pnpm-lock.yaml, requirements.txt, pyproject.toml, go.mod, Cargo.toml, etc.) \
+            and generate a comprehensive SBOM.md at ${SBOM_PATH}. \
+            Include: runtime environment, all production and development dependencies with \
+            package name, version/constraint, license, and purpose. \
+            Group by package/module where applicable. \
+            Use markdown tables. Include YAML frontmatter with title, scope, and last_updated (today's date). \
+            If an existing ${SBOM_PATH} exists, update it in place preserving its structure. \
+            Do NOT include emoji or unicode symbols."
+
+      - name: Commit and push SBOM changes
+        if: steps.deps.outputs.found == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/SBOM.md SBOM.md 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No SBOM changes detected"
+          else
+            git commit -m "chore: update SBOM.md [automated]"
+            git push
+          fi
